@@ -3,10 +3,13 @@ extern crate hyper_native_tls;
 extern crate pbr;
 extern crate clap;
 extern crate regex;
+extern crate stderrlog;
+#[macro_use]
+extern crate log;
+extern crate youtube_downloader;
 
 use pbr::ProgressBar;
 use std::{process, str};
-use std::collections::HashMap;
 use hyper::client::response::Response;
 use hyper::Client;
 use hyper::net::HttpsConnector;
@@ -17,12 +20,22 @@ use std::io::prelude::*;
 use std::fs::File;
 use clap::{Arg, App};
 use regex::Regex;
+use youtube_downloader::VideoInfo;
 
 fn main() {
     //Regex for youtube URLs.
     let url_regex = Regex::new(r"^.*(?:(?:youtu\.be/|v/|vi/|u/w/|embed/)|(?:(?:watch)?\?v(?:i)?=|\&v(?:i)?=))([^#\&\?]*).*").unwrap();
     let args = App::new("youtube-downloader")
         .version("0.1.0")
+        .arg(Arg::with_name("verbose")
+             .help("Increase verbosity")
+             .short("v")
+             .multiple(true)
+             .long("verbose"))
+        .arg(Arg::with_name("adaptive")
+             .help("List adaptive streams, instead of video streams")
+             .short("A")
+             .long("adaptive"))
         .arg(Arg::with_name("video-id")
             .help("The ID of the video to download.")
             .required(true)
@@ -36,62 +49,61 @@ fn main() {
              .takes_value(true))
         .get_matches();
 
+    stderrlog::new()
+            .module(module_path!())
+            .verbosity(args.occurrences_of("verbose") as usize)
+            .init()
+            .expect("Unable to initialize stderr output");
+
     let quality = args.value_of("quality");
+
     let mut vid = args.value_of("video-id").unwrap();
     if url_regex.is_match(vid) {
         let vid_split = url_regex.captures(vid).unwrap();
         vid = vid_split.get(1).unwrap().as_str();
     }
     let url = format!("https://youtube.com/get_video_info?video_id={}", vid);
-    download(&url, quality);
-}
 
-fn download(url: &str, quality: Option<&str>) {
+    download(&url, args.is_present("adaptive"), quality);
+} 
+
+fn download(url: &str, adaptive: bool, quality: Option<&str>) {
+    debug!("Fetching video info from {}", url);
+
     let mut response = send_request(url);
     let mut response_str = String::new();
     response.read_to_string(&mut response_str).unwrap();
-    let hq = parse_url(&response_str);
+    trace!("Response {}", response_str);
+    let info = VideoInfo::parse(&response_str).unwrap();
+    debug!("Video info {:#?}", info);
 
-    if hq["status"] != "ok" {
-        println!("Video not found!");
-        process::exit(1);
-    }
+    let streams = if adaptive {
+        info.adaptive_streams
+    } else {
+        info.streams
+    };
 
-    // get video info
-    let streams: Vec<&str> = hq["url_encoded_fmt_stream_map"]
-        .split(',')
-        .collect();
+    debug!("Streams: {:?}", streams);
 
-    // list of available qualities
-    let mut max: i32 = 0; 
-    let mut qualities: HashMap<i32, (String, String)> = HashMap::new();
-    for (i, url) in streams.iter().enumerate() {
-        let quality = parse_url(url);
-        let extension = quality["type"]
-            .split('/')
-            .nth(1)
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap();
-        qualities.insert(i as i32,
-                         (quality["url"].to_string(), extension.to_owned()));
+    for (i, stream) in streams.iter().enumerate() {
         println!("{}- {} {}",
                  i,
-                 quality["quality"],
-                 quality["type"]);
-        max = i as i32;
+                 stream.quality,
+                 stream.stream_type);
     }
 
+    let max = streams.len();
+
     println!("Choose quality: ");
-    let mut input: i32 = 0;
+    let mut input: usize = 0;
     let mut picked = false;
-    //Check if the -q argument was passed.
+
+    // Check if the -q argument was passed.
     if !quality.is_some() {
         while !picked {
             input = match read_line().trim().parse() {
                 Ok(num) => {
-                    if num <= max && num >= 0 {
+                    if num <= max {
                         picked = true;
                         num
                     } else {
@@ -108,7 +120,7 @@ fn download(url: &str, quality: Option<&str>) {
     } else {
         input = match quality.unwrap().parse() {
             Ok(num) => {
-                if num <= max && num >= 0 {
+                if num <= max {
                     num
                 } else {
                         println!("Please pick a number between 0 and {}", max);
@@ -124,20 +136,25 @@ fn download(url: &str, quality: Option<&str>) {
 
     println!("Please wait...");
 
-    let url = &qualities.get(&input).unwrap().0;
-    let extension = &qualities.get(&input).unwrap().1;
+    if let Some(ref stream) = streams.get(input) {
+        // get response from selected quality
+        debug!("Downloading {}", &stream.url);
+        let response = send_request(&stream.url);
+        println!("Download is starting...");
 
-    // get response from selected quality
-    let response = send_request(url);
-    println!("Download is starting...");
+        // get file size from Content-Length header
+        let file_size = get_file_size(&response);
 
-    // get file size from Content-Length header
-    let file_size = get_file_size(&response);
+        let filename = match stream.extension() {
+            Some(ext) => format!("{}.{}", info.title, ext),
+            None => info.title,
+        };
 
-    let filename = format!("{}.{}", hq["title"], extension);
-
-    // write file to disk
-    write_file(response, &filename, file_size);
+        // write file to disk
+        write_file(response, &filename, file_size);
+    } else {
+        error!("Invalid stream index");
+    }
 }
 
 // get file size from Content-Length header
@@ -178,15 +195,9 @@ fn send_request(url: &str) -> Response {
     let connector = HttpsConnector::new(ssl);
     let client = Client::with_connector(connector);
     client.get(url).send().unwrap_or_else(|e| {
-        println!("Network request failed: {}", e);
+        error!("Network request failed: {}", e);
         process::exit(1);
     })
-}
-
-fn parse_url(query: &str) -> HashMap<String, String> {
-    let u = format!("{}{}", "http://e.com?", query);
-    let parsed_url = hyper::Url::parse(&u).unwrap();
-    parsed_url.query_pairs().into_owned().collect()
 }
 
 fn read_line() -> String {
